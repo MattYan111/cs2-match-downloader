@@ -1,0 +1,42 @@
+{
+  "statusCode": 0,
+  "errorMessage": "success",
+  "data": {
+    "matchList": [
+      {
+        "matchId": "LOCAL@demo-match-001",
+        "playerId": "76561198000000001",
+        "mapName": "炙热沙城Ⅱ",
+        "mode": "国服竞技",
+        "score1": 13,
+        "score2": 10,
+        "team": 1,
+        "winTeam": 1,
+        "startTime": "2026-11-10 20:00:00",
+        "endTime": "2026-11-10 20:38:15",
+        "kill": 21,
+        "death": 14,
+        "assist": 5,
+        "rating": 1.27,
+        "pageTimeStamp": 1794340800
+      },
+      {
+        "matchId": "LOCAL@demo-match-002",
+        "playerId": "76561198000000001",
+        "mapName": "荒漠迷城",
+        "mode": "国服竞技",
+        "score1": 9,
+        "score2": 13,
+        "team": 1,
+        "winTeam": 2,
+        "startTime": "2026-11-10 19:00:00",
+        "endTime": "2026-11-10 19:42:00",
+        "kill": 14,
+        "death": 18,
+        "assist": 3,
+        "rating": 0.89,
+        "pageTimeStamp": 1794337200
+      }
+    ]
+  }
+}

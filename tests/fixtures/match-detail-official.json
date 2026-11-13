@@ -1,0 +1,52 @@
+{
+  "statusCode": 0,
+  "errorMessage": "success",
+  "data": {
+    "base": {
+      "matchId": "LOCAL@demo-match-001",
+      "map": "炙热沙城Ⅱ",
+      "mapEn": "de_dust2",
+      "startTime": "2026-11-10 20:00:00",
+      "endTime": "2026-11-10 20:38:15",
+      "score1": 13,
+      "score2": 10,
+      "halfScore1": 7,
+      "halfScore2": 5,
+      "extraScore1": 0,
+      "extraScore2": 0,
+      "winTeam": 1,
+      "bigNumericAuditId": 9007199254740993,
+      "unknownFutureField": {
+        "nested": [1, null, "keep-me"]
+      }
+    },
+    "players": [
+      {
+        "playerId": "76561198000000001",
+        "steamUidNum": 76561199437647584,
+        "nickName": "示例好友A",
+        "team": 1,
+        "kill": 21,
+        "death": 14,
+        "assist": 5,
+        "rating": 1.27,
+        "pwRating": 0,
+        "adpr": 88.4,
+        "rws": 12.34
+      },
+      {
+        "playerId": "76561198000000002",
+        "steamUidNum": 76561199437647585,
+        "nickName": "路人B",
+        "team": 2,
+        "kill": 15,
+        "death": 17,
+        "assist": 4,
+        "rating": null,
+        "pwRating": 0,
+        "adpr": 71.2,
+        "rws": 8.1
+      }
+    ]
+  }
+}
