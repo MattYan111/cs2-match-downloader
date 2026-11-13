@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execSync } from 'node:child_process';
 import { chmod, cp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -60,8 +60,7 @@ async function main() {
   );
   await cp(path.join(rootDir, 'package-lock.json'), path.join(stageDir, 'package-lock.json'));
 
-  const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-  execFileSync(npmCmd, ['ci', '--omit=dev', '--ignore-scripts'], {
+  execSync('npm ci --omit=dev --ignore-scripts', {
     cwd: stageDir,
     stdio: 'inherit'
   });
