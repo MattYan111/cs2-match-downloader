@@ -73,3 +73,16 @@ export interface JobPublicState {
   downloadFilename: string | null;
   downloadKind: 'json' | 'zip' | null;
 }
+
+export interface PlayerSourceWatermark {
+  lastMatchId: string;
+  lastStartTime: string | null;
+  updatedAt: string;
+}
+
+export interface SavedPlayerProfile {
+  steamId: string;
+  note: string;
+  enabled: boolean;
+  watermarks: Partial<Record<MatchSource, PlayerSourceWatermark>>;
+}

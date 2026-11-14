@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import JSZip from 'jszip';
 import { createTempExportRoot, removeTempDirSafe } from '../src/export.js';
 import { ExportJobManager } from '../src/jobs.js';
+import { parsePlayerInputLines, PlayersStore } from '../src/players-store.js';
 import { PerfectWorldProvider } from '../src/provider/perfectworld.js';
 import { startDownloaderServer } from '../src/server.js';
 
@@ -276,5 +277,256 @@ test('local server enforces 127.0.0.1 host, origin, and client header guards', a
     assert.equal(okRes.status, 200);
   } finally {
     await started.close();
+  }
+});
+
+test('PlayersStore persistence, API endpoints, and multi-player incremental sync with deduplication', async () => {
+  const detailFixture = await readFile(path.join(fixturesDir, 'match-detail-official.json'), 'utf8');
+  const tempRoot = await createTempExportRoot();
+  const storePath = path.join(tempRoot, 'players.json');
+  const playersStore = new PlayersStore(storePath);
+
+  // parsePlayerInputLines handles common formats
+  const parsedLines = parsePlayerInputLines(
+    '# comment\n76561198000000001 好友A\n76561198000000002 # 好友B\n'
+  );
+  assert.deepEqual(parsedLines, [
+    { steamId: '76561198000000001', note: '好友A' },
+    { steamId: '76561198000000002', note: '好友B' }
+  ]);
+  assert.throws(() => parsePlayerInputLines('not-a-steam-id'), /SteamID64/);
+
+  const p1 = '76561198000000001';
+  const p2 = '76561198000000002';
+  let phase = 1;
+  const detailRequests: Array<{ matchId: string; dataSource: number }> = [];
+
+  const mockFetch: typeof fetch = async (input, init) => {
+    const url = typeof input === 'string' ? input : input.toString();
+    const reqBody = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
+
+    if (url.endsWith('/qrAuth/applyToken')) {
+      return new Response(
+        JSON.stringify({
+          code: 0,
+          result: { accessUrl: 'https://passport.pwesports.cn/qr?accessToken=TEST_QR' }
+        }),
+        { status: 200 }
+      );
+    }
+    if (url.endsWith('/qrAuth/check')) {
+      return new Response(
+        `{"code":0,"result":{"status":2,"token":"TEST_TOKEN","accountItem":{"steamId":${p1},"nickName":"Me","avatar":null}}}`,
+        { status: 200 }
+      );
+    }
+    if (url.endsWith('/api/csgo/home/match/list')) {
+      const toSteamId = String(reqBody.toSteamId);
+      const dataSource = Number(reqBody.dataSource); // 1=official, 3=perfectworld
+      const page = Number(reqBody.page);
+      if (page > 1) {
+        return new Response(JSON.stringify({ statusCode: 0, data: { matchList: [] } }), { status: 200 });
+      }
+
+      if (phase === 1) {
+        if (toSteamId === p1 && dataSource === 1) {
+          return new Response(
+            JSON.stringify({
+              statusCode: 0,
+              data: {
+                matchList: [
+                  { matchId: 'OFF-SHARED-001', startTime: '2026-11-10 21:00:00', pageTimeStamp: 1 },
+                  { matchId: 'OFF-P1-OLD', startTime: '2026-11-10 19:00:00', pageTimeStamp: 2 }
+                ]
+              }
+            }),
+            { status: 200 }
+          );
+        }
+        if (toSteamId === p1 && dataSource === 3) {
+          return new Response(
+            JSON.stringify({
+              statusCode: 0,
+              data: {
+                matchList: [
+                  { matchId: 'PW-P1-001', startTime: '2026-11-10 22:00:00', pageTimeStamp: 3 }
+                ]
+              }
+            }),
+            { status: 200 }
+          );
+        }
+        if (toSteamId === p2 && dataSource === 1) {
+          return new Response(
+            JSON.stringify({
+              statusCode: 0,
+              data: {
+                matchList: [
+                  { matchId: 'OFF-SHARED-001', startTime: '2026-11-10 21:00:00', pageTimeStamp: 1 },
+                  { matchId: 'OFF-P2-OLD', startTime: '2026-11-09 20:00:00', pageTimeStamp: 4 }
+                ]
+              }
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response(JSON.stringify({ statusCode: 0, data: { matchList: [] } }), { status: 200 });
+      }
+
+      // Phase 2: incremental sync with 1 new official match for P1 + older watermark matches
+      if (toSteamId === p1 && dataSource === 1) {
+        return new Response(
+          JSON.stringify({
+            statusCode: 0,
+            data: {
+              matchList: [
+                { matchId: 'OFF-P1-NEW', startTime: '2026-11-11 20:00:00', pageTimeStamp: 10 },
+                { matchId: 'OFF-SHARED-001', startTime: '2026-11-10 21:00:00', pageTimeStamp: 1 }
+              ]
+            }
+          }),
+          { status: 200 }
+        );
+      }
+      if (toSteamId === p1 && dataSource === 3) {
+        return new Response(
+          JSON.stringify({
+            statusCode: 0,
+            data: {
+              matchList: [
+                { matchId: 'PW-P1-001', startTime: '2026-11-10 22:00:00', pageTimeStamp: 3 }
+              ]
+            }
+          }),
+          { status: 200 }
+        );
+      }
+      if (toSteamId === p2 && dataSource === 1) {
+        return new Response(
+          JSON.stringify({
+            statusCode: 0,
+            data: {
+              matchList: [
+                { matchId: 'OFF-SHARED-001', startTime: '2026-11-10 21:00:00', pageTimeStamp: 1 }
+              ]
+            }
+          }),
+          { status: 200 }
+        );
+      }
+      return new Response(JSON.stringify({ statusCode: 0, data: { matchList: [] } }), { status: 200 });
+    }
+
+    if (url.endsWith('/api/v1/csgo/match')) {
+      const matchId = String(reqBody.matchId);
+      const dataSource = Number(reqBody.dataSource);
+      detailRequests.push({ matchId, dataSource });
+      return new Response(makeDetailPayload(matchId, detailFixture), { status: 200 });
+    }
+
+    return new Response('Not found', { status: 404 });
+  };
+
+  const provider = new PerfectWorldProvider({ fetchImpl: mockFetch });
+  const started = await startDownloaderServer({
+    provider,
+    playersStore,
+    tempRootDir: path.join(tempRoot, 'work'),
+    detailDelayMs: 0,
+    listDelayMs: 0,
+    retryBaseDelayMs: 0,
+    port: 0,
+    open: false,
+    devMode: false
+  });
+
+  try {
+    // 1. Add, update, remove via HTTP API + verify persistence in PlayersStore file
+    const addRes = await fetch(`${started.url}/api/players/add`, {
+      method: 'POST',
+      headers: { Origin: started.url, 'Content-Type': 'application/json', 'X-PW-Client': '1' },
+      body: JSON.stringify({ text: `${p1} 玩家一\n${p2} 玩家二\n76561198000000003 临时` })
+    });
+    assert.equal(addRes.status, 200);
+
+    const removeRes = await fetch(`${started.url}/api/players/remove`, {
+      method: 'POST',
+      headers: { Origin: started.url, 'Content-Type': 'application/json', 'X-PW-Client': '1' },
+      body: JSON.stringify({ steamId: '76561198000000003' })
+    });
+    assert.equal(removeRes.status, 200);
+    const afterRemove = (await removeRes.json()) as { players: Array<{ steamId: string; note: string }> };
+    assert.equal(afterRemove.players.length, 2);
+
+    const rawFile = await readFile(storePath, 'utf8');
+    assert.match(rawFile, /玩家一/);
+    assert.doesNotMatch(rawFile, /76561198000000003/);
+
+    // 2. Authenticate and run initial multi-sync (no watermarks -> full history for both players)
+    await provider.createQrCode();
+    await provider.pollQrStatus();
+
+    const sync1 = await started.jobManager.startMultiSyncJob({
+      steamIds: [p1, p2],
+      sources: ['official', 'perfectworld'],
+      syncMode: 'incremental',
+      includeRaw: false
+    });
+    assert.equal(sync1.status, 'listing');
+    await started.jobManager.waitForCurrentRun();
+
+    const state1 = started.jobManager.getPublicState();
+    assert.equal(state1.status, 'completed');
+    // Unique matches: OFF-SHARED-001, OFF-P1-OLD, PW-P1-001, OFF-P2-OLD (4 unique total; OFF-SHARED-001 fetched once!)
+    assert.equal(state1.succeededCount, 4);
+    assert.equal(detailRequests.length, 4);
+
+    const zip1 = await JSZip.loadAsync(await readFile(started.jobManager.getDownloadArtifact()!.filePath));
+    assert.ok(zip1.file('matches/official-OFF-SHARED-001.json'));
+    assert.ok(zip1.file('matches/official-OFF-P1-OLD.json'));
+    assert.ok(zip1.file('matches/perfectworld-PW-P1-001.json'));
+    assert.ok(zip1.file('matches/official-OFF-P2-OLD.json'));
+
+    // Verify watermarks persisted
+    const listAfter1 = await playersStore.getAll();
+    const savedP1 = listAfter1.find((p) => p.steamId === p1)!;
+    const savedP2 = listAfter1.find((p) => p.steamId === p2)!;
+    assert.equal(savedP1.watermarks.official?.lastMatchId, 'OFF-SHARED-001');
+    assert.equal(savedP1.watermarks.perfectworld?.lastMatchId, 'PW-P1-001');
+    assert.equal(savedP2.watermarks.official?.lastMatchId, 'OFF-SHARED-001');
+
+    // 3. Second incremental sync: only OFF-P1-NEW should be downloaded
+    phase = 2;
+    detailRequests.length = 0;
+
+    await started.jobManager.startMultiSyncJob({
+      steamIds: [p1, p2],
+      sources: ['official', 'perfectworld'],
+      syncMode: 'incremental',
+      includeRaw: false
+    });
+    await started.jobManager.waitForCurrentRun();
+
+    const state2 = started.jobManager.getPublicState();
+    assert.equal(state2.status, 'completed');
+    assert.equal(state2.succeededCount, 1);
+    assert.deepEqual(detailRequests, [{ matchId: 'OFF-P1-NEW', dataSource: 1 }]);
+
+    const listAfter2 = await playersStore.getAll();
+    assert.equal(listAfter2.find((p) => p.steamId === p1)!.watermarks.official?.lastMatchId, 'OFF-P1-NEW');
+
+    // 4. Reset watermark for P1 official via API
+    const resetRes = await fetch(`${started.url}/api/players/update`, {
+      method: 'POST',
+      headers: { Origin: started.url, 'Content-Type': 'application/json', 'X-PW-Client': '1' },
+      body: JSON.stringify({ steamId: p1, clearSource: 'official' })
+    });
+    assert.equal(resetRes.status, 200);
+    const listAfterReset = await playersStore.getAll();
+    assert.equal(listAfterReset.find((p) => p.steamId === p1)!.watermarks.official, undefined);
+    assert.equal(listAfterReset.find((p) => p.steamId === p1)!.watermarks.perfectworld?.lastMatchId, 'PW-P1-001');
+  } finally {
+    await started.close();
+    await removeTempDirSafe(tempRoot);
   }
 });

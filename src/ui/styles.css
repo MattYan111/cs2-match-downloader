@@ -521,6 +521,91 @@ body {
   text-align: center;
 }
 
+.header-left-group {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+
+.multi-sync-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.multi-add-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.note-input {
+  width: 150px;
+}
+
+.bulk-paste-box {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  background: #f8fafc;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.bulk-textarea {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 13px;
+  resize: vertical;
+  background: #fff;
+}
+
+.bulk-paste-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.wm-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.wm-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.multi-export-bar {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.multi-options {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 16px;
+}
+
+.multi-option-group {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
 @media (max-width: 860px) {
   .layout-grid {
     grid-template-columns: 1fr;

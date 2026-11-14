@@ -10,6 +10,7 @@ import {
   removeTempDirSafe
 } from './export.js';
 import { ExportJobManager } from './jobs.js';
+import { parsePlayerInputLines, PlayersStore, STEAM_ID64_RE } from './players-store.js';
 import {
   AuthExpiredError,
   type MatchSource,
@@ -19,6 +20,8 @@ import {
 
 export interface AppServerOptions {
   provider?: PerfectWorldProvider;
+  playersStore?: PlayersStore;
+  playersStorePath?: string;
   tempRootDir?: string;
   uiDistDir?: string;
   devMode?: boolean;
@@ -65,9 +68,11 @@ function openBrowser(url: string): void {
 
 export function createDownloaderApp(options: AppServerOptions & { getBoundPort: () => number }) {
   const provider = options.provider ?? new PerfectWorldProvider();
+  const playersStore = options.playersStore ?? new PlayersStore(options.playersStorePath);
   const tempRootDir = options.tempRootDir ?? '';
   const jobManager = new ExportJobManager(provider, {
     tempRootDir,
+    playersStore,
     detailDelayMs: options.detailDelayMs,
     listDelayMs: options.listDelayMs,
     retryBaseDelayMs: options.retryBaseDelayMs
@@ -318,6 +323,101 @@ export function createDownloaderApp(options: AppServerOptions & { getBoundPort: 
       res.json(state);
     } catch (error) {
       res.status(400).json({ error: error instanceof Error ? error.message : '启动最近 N 场导出失败' });
+    }
+  });
+
+  app.get('/api/players', async (_req: Request, res: Response) => {
+    try {
+      const players = await playersStore.getAll();
+      res.json({ players, storePath: playersStore.filePath });
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : '读取已保存玩家失败' });
+    }
+  });
+
+  app.post('/api/players/add', async (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    try {
+      let entries: Array<{ steamId: string; note?: string; enabled?: boolean }>;
+      if (typeof body.text === 'string' && body.text.trim()) {
+        entries = parsePlayerInputLines(body.text);
+        if (entries.length === 0) {
+          res.status(400).json({ error: '未解析到任何 17 位 SteamID64' });
+          return;
+        }
+      } else {
+        const steamId = typeof body.steamId === 'string' ? body.steamId.trim() : '';
+        if (!STEAM_ID64_RE.test(steamId)) {
+          res.status(400).json({ error: '请输入有效的 17 位 SteamID64' });
+          return;
+        }
+        const note = typeof body.note === 'string' ? body.note.trim() : '';
+        entries = [{ steamId, note }];
+      }
+      const players = await playersStore.upsertMany(entries);
+      res.json({ players });
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : '保存玩家失败' });
+    }
+  });
+
+  app.post('/api/players/update', async (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const steamId = typeof body.steamId === 'string' ? body.steamId.trim() : '';
+    if (!STEAM_ID64_RE.test(steamId)) {
+      res.status(400).json({ error: '无效的 17 位 SteamID64' });
+      return;
+    }
+    const clearSource = isValidSource(body.clearSource) ? body.clearSource : undefined;
+    try {
+      const players = await playersStore.updatePlayer(steamId, {
+        ...(typeof body.note === 'string' ? { note: body.note } : {}),
+        ...(typeof body.enabled === 'boolean' ? { enabled: body.enabled } : {}),
+        ...(body.resetWatermarks === true ? { resetWatermarks: true } : {}),
+        ...(clearSource ? { clearSource } : {})
+      });
+      res.json({ players });
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : '更新玩家信息失败' });
+    }
+  });
+
+  app.post('/api/players/remove', async (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const steamId = typeof body.steamId === 'string' ? body.steamId.trim() : '';
+    if (!STEAM_ID64_RE.test(steamId)) {
+      res.status(400).json({ error: '无效的 17 位 SteamID64' });
+      return;
+    }
+    try {
+      const players = await playersStore.removePlayer(steamId);
+      res.json({ players });
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : '移除玩家失败' });
+    }
+  });
+
+  app.post('/api/jobs/export-multi-sync', async (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const steamIds = Array.isArray(body.steamIds)
+      ? body.steamIds.filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
+      : [];
+    const sources = Array.isArray(body.sources)
+      ? body.sources.filter((src): src is MatchSource => isValidSource(src))
+      : [];
+    const syncMode = body.syncMode === 'full' ? 'full' : 'incremental';
+    const includeRaw = body.includeRaw === true;
+
+    try {
+      const state = await jobManager.startMultiSyncJob({
+        steamIds,
+        sources,
+        syncMode,
+        includeRaw
+      });
+      res.json(state);
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : '启动多玩家导出失败' });
     }
   });
 

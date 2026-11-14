@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { AuthPublicState, JobPublicState, MatchSource, MatchSummary } from './types';
+import type {
+  AuthPublicState,
+  JobPublicState,
+  MatchSource,
+  MatchSummary,
+  SavedPlayerProfile
+} from './types';
 
 async function apiGet<T>(url: string): Promise<T> {
   const res = await fetch(url, { cache: 'no-store' });
@@ -133,7 +139,24 @@ export function App() {
   const [jobError, setJobError] = useState<string | null>(null);
   const [exited, setExited] = useState(false);
 
+  const [workMode, setWorkMode] = useState<'single' | 'multi'>('single');
+  const workModeTouchedRef = useRef(false);
+  const [savedPlayers, setSavedPlayers] = useState<SavedPlayerProfile[]>([]);
+  const [storePath, setStorePath] = useState<string>('');
+  const [playersBusy, setPlayersBusy] = useState(false);
+  const [playersError, setPlayersError] = useState<string | null>(null);
+  const [newSteamId, setNewSteamId] = useState('');
+  const [newNote, setNewNote] = useState('');
+  const [showBulkPaste, setShowBulkPaste] = useState(false);
+  const [bulkPasteText, setBulkPasteText] = useState('');
+  const [multiSources, setMultiSources] = useState<{ official: boolean; perfectworld: boolean }>({
+    official: true,
+    perfectworld: true
+  });
+  const [syncMode, setSyncMode] = useState<'incremental' | 'full'>('incremental');
+
   const qrAutoRequestedRef = useRef(false);
+  const prevJobStatusRef = useRef<JobPublicState['status']>('idle');
 
   const activeTargetSteamId = useMemo(() => {
     if (playerMode === 'self') return auth.user?.steamId ?? '';
@@ -167,23 +190,45 @@ export function App() {
     }
   }, [refreshQr]);
 
+  const fetchSavedPlayers = useCallback(async () => {
+    try {
+      const res = await apiGet<{ players: SavedPlayerProfile[]; storePath?: string }>('/api/players');
+      setSavedPlayers(res.players);
+      if (res.storePath) setStorePath(res.storePath);
+      if (!workModeTouchedRef.current && res.players.length > 0) {
+        setWorkMode('multi');
+      }
+    } catch {
+      // Ignore transient error on exit
+    }
+  }, []);
+
   const fetchJobState = useCallback(async () => {
     try {
       const state = await apiGet<JobPublicState>('/api/jobs/state');
+      const prevStatus = prevJobStatusRef.current;
+      prevJobStatusRef.current = state.status;
       setJob(state);
       if (state.status === 'paused_auth') {
         void fetchAuthState();
       }
+      if (
+        prevStatus !== state.status &&
+        (state.status === 'completed' || state.status === 'partial')
+      ) {
+        void fetchSavedPlayers();
+      }
     } catch {
       // Ignore poll errors
     }
-  }, [fetchAuthState]);
+  }, [fetchAuthState, fetchSavedPlayers]);
 
   useEffect(() => {
     if (exited) return;
     void fetchAuthState();
     void fetchJobState();
-  }, [exited, fetchAuthState, fetchJobState]);
+    void fetchSavedPlayers();
+  }, [exited, fetchAuthState, fetchJobState, fetchSavedPlayers]);
 
   useEffect(() => {
     if (exited) return;
@@ -366,6 +411,7 @@ export function App() {
     setJobError(null);
     try {
       const state = await apiPost<JobPublicState>('/api/jobs/resume');
+      prevJobStatusRef.current = state.status;
       setJob(state);
     } catch (error) {
       setJobError(error instanceof Error ? error.message : '继续任务失败');
@@ -376,6 +422,7 @@ export function App() {
     setJobError(null);
     try {
       const state = await apiPost<JobPublicState>('/api/jobs/retry-failed');
+      prevJobStatusRef.current = state.status;
       setJob(state);
     } catch (error) {
       setJobError(error instanceof Error ? error.message : '重试失败');
@@ -386,9 +433,134 @@ export function App() {
     setJobError(null);
     try {
       const state = await apiPost<JobPublicState>('/api/jobs/cancel');
+      prevJobStatusRef.current = state.status;
       setJob(state);
     } catch (error) {
       setJobError(error instanceof Error ? error.message : '取消失败');
+    }
+  };
+
+  const handleAddSinglePlayer = async () => {
+    setPlayersError(null);
+    setPlayersBusy(true);
+    try {
+      const res = await apiPost<{ players: SavedPlayerProfile[] }>('/api/players/add', {
+        steamId: newSteamId.trim(),
+        note: newNote.trim()
+      });
+      setSavedPlayers(res.players);
+      setNewSteamId('');
+      setNewNote('');
+    } catch (error) {
+      setPlayersError(error instanceof Error ? error.message : '添加玩家失败');
+    } finally {
+      setPlayersBusy(false);
+    }
+  };
+
+  const handleAddCurrentAuthPlayer = async () => {
+    if (!auth.user) return;
+    setPlayersError(null);
+    setPlayersBusy(true);
+    try {
+      const res = await apiPost<{ players: SavedPlayerProfile[] }>('/api/players/add', {
+        steamId: auth.user.steamId,
+        note: auth.user.nickname ?? ''
+      });
+      setSavedPlayers(res.players);
+    } catch (error) {
+      setPlayersError(error instanceof Error ? error.message : '添加当前账号失败');
+    } finally {
+      setPlayersBusy(false);
+    }
+  };
+
+  const handleBulkAddPlayers = async () => {
+    if (!bulkPasteText.trim()) {
+      setPlayersError('请先粘贴包含 17 位 SteamID64 的文本');
+      return;
+    }
+    setPlayersError(null);
+    setPlayersBusy(true);
+    try {
+      const res = await apiPost<{ players: SavedPlayerProfile[] }>('/api/players/add', {
+        text: bulkPasteText
+      });
+      setSavedPlayers(res.players);
+      setBulkPasteText('');
+      setShowBulkPaste(false);
+    } catch (error) {
+      setPlayersError(error instanceof Error ? error.message : '批量导入玩家失败');
+    } finally {
+      setPlayersBusy(false);
+    }
+  };
+
+  const handleUpdateSavedPlayer = async (
+    steamId: string,
+    patch: { enabled?: boolean; resetWatermarks?: boolean; clearSource?: MatchSource }
+  ) => {
+    setPlayersError(null);
+    setPlayersBusy(true);
+    try {
+      const res = await apiPost<{ players: SavedPlayerProfile[] }>('/api/players/update', {
+        steamId,
+        ...patch
+      });
+      setSavedPlayers(res.players);
+    } catch (error) {
+      setPlayersError(error instanceof Error ? error.message : '更新玩家设置失败');
+    } finally {
+      setPlayersBusy(false);
+    }
+  };
+
+  const handleRemoveSavedPlayer = async (steamId: string) => {
+    setPlayersError(null);
+    setPlayersBusy(true);
+    try {
+      const res = await apiPost<{ players: SavedPlayerProfile[] }>('/api/players/remove', {
+        steamId
+      });
+      setSavedPlayers(res.players);
+    } catch (error) {
+      setPlayersError(error instanceof Error ? error.message : '删除玩家失败');
+    } finally {
+      setPlayersBusy(false);
+    }
+  };
+
+  const startMultiSyncExport = async () => {
+    if (!auth.authenticated) {
+      setJobError('请先扫码登录');
+      return;
+    }
+    const targetIds = savedPlayers.filter((p) => p.enabled).map((p) => p.steamId);
+    const chosenSources: MatchSource[] = [];
+    if (multiSources.official) chosenSources.push('official');
+    if (multiSources.perfectworld) chosenSources.push('perfectworld');
+
+    if (targetIds.length === 0) {
+      setJobError('请先添加并勾选至少一位要导出的玩家');
+      return;
+    }
+    if (chosenSources.length === 0) {
+      setJobError('请至少勾选一个比赛来源（国服官匹 / 完美平台）');
+      return;
+    }
+
+    setJobError(null);
+    try {
+      const state = await apiPost<JobPublicState>('/api/jobs/export-multi-sync', {
+        steamIds: targetIds,
+        sources: chosenSources,
+        syncMode,
+        includeRaw
+      });
+      prevJobStatusRef.current = state.status;
+      setJob(state);
+    } catch (error) {
+      setJobError(error instanceof Error ? error.message : '启动多玩家导出失败');
     }
   };
 
@@ -402,6 +574,10 @@ export function App() {
   };
 
   const jobRunning = job.status === 'listing' || job.status === 'downloading';
+  const enabledSavedCount = savedPlayers.filter((p) => p.enabled).length;
+  const authAlreadySaved = Boolean(
+    auth.user && savedPlayers.some((p) => p.steamId === auth.user?.steamId)
+  );
   const progressPercent =
     job.totalCount > 0
       ? Math.round(((job.succeededCount + job.failedCount + job.cancelledCount) / job.totalCount) * 100)
@@ -521,7 +697,12 @@ export function App() {
                 <div className="stat-box">
                   <span className="stat-label">来源 / 目标</span>
                   <strong className="stat-value-sm">
-                    {job.sourceLabel || '—'} · {job.targetSteamId ? job.targetSteamId.slice(-6) : '—'}
+                    {job.sourceLabel || '—'} ·{' '}
+                    {job.targetSteamId
+                      ? /^\d{17}$/.test(job.targetSteamId)
+                        ? job.targetSteamId.slice(-6)
+                        : job.targetSteamId
+                      : '—'}
                   </strong>
                 </div>
               </div>
@@ -585,13 +766,319 @@ export function App() {
         {/* 2. 比赛列表与导出区 */}
         <section className="card card-full">
           <div className="card-header">
-            <h2>2. 比赛列表与选择</h2>
+            <div className="header-left-group">
+              <h2>2. 比赛列表与导出</h2>
+              <div className="segmented" role="tablist" aria-label="导出工作模式">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={workMode === 'single'}
+                  className={workMode === 'single' ? 'active' : ''}
+                  onClick={() => {
+                    workModeTouchedRef.current = true;
+                    setWorkMode('single');
+                  }}
+                >
+                  单人列表查询与选择
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={workMode === 'multi'}
+                  className={workMode === 'multi' ? 'active' : ''}
+                  onClick={() => {
+                    workModeTouchedRef.current = true;
+                    setWorkMode('multi');
+                  }}
+                >
+                  多玩家增量批量导出（{savedPlayers.length}）
+                </button>
+              </div>
+            </div>
             <span className="hint">
               默认导出原始 <code className="mono">data</code> JSON，保留全部字段与大整数精度
             </span>
           </div>
 
-          <div className="controls-panel">
+          {workMode === 'multi' ? (
+            <div className="multi-sync-panel">
+              <p className="hint" style={{ marginTop: 0 }}>
+                常用 SteamID 名单与每位玩家的上次导出水位仅保存在本机配置文件（
+                <code className="mono">{storePath || 'players.json'}</code>
+                ），不存储登录凭证。无历史水位的玩家首次将拉取全部可查比赛，之后仅自动导出最新一场之后的新比赛并跨玩家去重打包为单个 ZIP。
+              </p>
+
+              <div className="multi-add-row">
+                <input
+                  type="text"
+                  className="text-input mono"
+                  placeholder="输入 17 位 SteamID64"
+                  value={newSteamId}
+                  onChange={(e) => setNewSteamId(e.target.value)}
+                />
+                <input
+                  type="text"
+                  className="text-input note-input"
+                  placeholder="备注昵称（可选）"
+                  value={newNote}
+                  onChange={(e) => setNewNote(e.target.value)}
+                />
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  disabled={playersBusy}
+                  onClick={handleAddSinglePlayer}
+                >
+                  添加玩家
+                </button>
+                {auth.authenticated && auth.user && !authAlreadySaved && (
+                  <button
+                    type="button"
+                    className="btn btn-secondary"
+                    disabled={playersBusy}
+                    onClick={handleAddCurrentAuthPlayer}
+                  >
+                    + 加入当前账号（{auth.user.nickname || auth.user.steamId.slice(-6)}）
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  disabled={playersBusy}
+                  onClick={() => setShowBulkPaste((v) => !v)}
+                >
+                  {showBulkPaste ? '收起批量粘贴' : '批量粘贴添加'}
+                </button>
+              </div>
+
+              {showBulkPaste && (
+                <div className="bulk-paste-box">
+                  <textarea
+                    className="bulk-textarea mono"
+                    rows={4}
+                    placeholder={'每行一个玩家，例如：\n76561198000000001 好友A\n76561198000000002 # 好友B'}
+                    value={bulkPasteText}
+                    onChange={(e) => setBulkPasteText(e.target.value)}
+                  />
+                  <div className="bulk-paste-actions">
+                    <button
+                      type="button"
+                      className="btn btn-primary btn-sm"
+                      disabled={playersBusy}
+                      onClick={handleBulkAddPlayers}
+                    >
+                      解析并加入列表
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-sm"
+                      disabled={playersBusy}
+                      onClick={() => {
+                        setShowBulkPaste(false);
+                        setBulkPasteText('');
+                      }}
+                    >
+                      取消
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {playersError && <p className="error-text">{playersError}</p>}
+
+              {savedPlayers.length === 0 ? (
+                <div className="empty-state">
+                  尚未保存任何常用玩家，请先在上方添加或批量粘贴 17 位 SteamID64。
+                </div>
+              ) : (
+                <div className="table-wrap">
+                  <table className="match-table">
+                    <thead>
+                      <tr>
+                        <th style={{ width: 42 }}>启用</th>
+                        <th>备注 / SteamID64</th>
+                        <th>国服官匹上次水位</th>
+                        <th>完美平台上次水位</th>
+                        <th style={{ width: 148 }}>操作</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {savedPlayers.map((p) => {
+                        const offWm = p.watermarks.official;
+                        const pwWm = p.watermarks.perfectworld;
+                        return (
+                          <tr key={p.steamId} className={p.enabled ? 'row-selected' : ''}>
+                            <td>
+                              <input
+                                type="checkbox"
+                                checked={p.enabled}
+                                disabled={playersBusy || jobRunning}
+                                aria-label={`启用玩家 ${p.note || p.steamId}`}
+                                onChange={(e) =>
+                                  handleUpdateSavedPlayer(p.steamId, { enabled: e.target.checked })
+                                }
+                              />
+                            </td>
+                            <td>
+                              <div>{p.note || '未命名玩家'}</div>
+                              <div className="mono muted small">{p.steamId}</div>
+                            </td>
+                            <td>
+                              {offWm ? (
+                                <div className="wm-cell">
+                                  <span className="mono small">
+                                    {offWm.lastStartTime
+                                      ? formatTimeShort(offWm.lastStartTime)
+                                      : offWm.lastMatchId}
+                                  </span>
+                                  <button
+                                    type="button"
+                                    className="btn btn-secondary btn-xs"
+                                    disabled={playersBusy || jobRunning}
+                                    onClick={() =>
+                                      handleUpdateSavedPlayer(p.steamId, { clearSource: 'official' })
+                                    }
+                                  >
+                                    清空
+                                  </button>
+                                </div>
+                              ) : (
+                                <span className="muted small">无记录（下次全量）</span>
+                              )}
+                            </td>
+                            <td>
+                              {pwWm ? (
+                                <div className="wm-cell">
+                                  <span className="mono small">
+                                    {pwWm.lastStartTime
+                                      ? formatTimeShort(pwWm.lastStartTime)
+                                      : pwWm.lastMatchId}
+                                  </span>
+                                  <button
+                                    type="button"
+                                    className="btn btn-secondary btn-xs"
+                                    disabled={playersBusy || jobRunning}
+                                    onClick={() =>
+                                      handleUpdateSavedPlayer(p.steamId, {
+                                        clearSource: 'perfectworld'
+                                      })
+                                    }
+                                  >
+                                    清空
+                                  </button>
+                                </div>
+                              ) : (
+                                <span className="muted small">无记录（下次全量）</span>
+                              )}
+                            </td>
+                            <td>
+                              <div className="wm-actions">
+                                <button
+                                  type="button"
+                                  className="btn btn-secondary btn-xs"
+                                  disabled={
+                                    playersBusy || jobRunning || (!offWm && !pwWm)
+                                  }
+                                  onClick={() =>
+                                    handleUpdateSavedPlayer(p.steamId, { resetWatermarks: true })
+                                  }
+                                >
+                                  重置水位
+                                </button>
+                                <button
+                                  type="button"
+                                  className="btn btn-danger-outline btn-xs"
+                                  disabled={playersBusy || jobRunning}
+                                  onClick={() => handleRemoveSavedPlayer(p.steamId)}
+                                >
+                                  删除
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+
+              <div className="multi-export-bar">
+                <div className="multi-options">
+                  <div className="multi-option-group">
+                    <span className="group-label">平台来源：</span>
+                    <label className="checkbox-label">
+                      <input
+                        type="checkbox"
+                        checked={multiSources.official}
+                        disabled={jobRunning}
+                        onChange={(e) =>
+                          setMultiSources((prev) => ({ ...prev, official: e.target.checked }))
+                        }
+                      />
+                      <span>国服官匹</span>
+                    </label>
+                    <label className="checkbox-label">
+                      <input
+                        type="checkbox"
+                        checked={multiSources.perfectworld}
+                        disabled={jobRunning}
+                        onChange={(e) =>
+                          setMultiSources((prev) => ({ ...prev, perfectworld: e.target.checked }))
+                        }
+                      />
+                      <span>完美平台</span>
+                    </label>
+                  </div>
+
+                  <div className="multi-option-group">
+                    <span className="group-label">同步方式：</span>
+                    <div className="segmented">
+                      <button
+                        type="button"
+                        disabled={jobRunning}
+                        className={syncMode === 'incremental' ? 'active' : ''}
+                        onClick={() => setSyncMode('incremental')}
+                      >
+                        增量导出（新比赛）
+                      </button>
+                      <button
+                        type="button"
+                        disabled={jobRunning}
+                        className={syncMode === 'full' ? 'active' : ''}
+                        onClick={() => setSyncMode('full')}
+                      >
+                        全量导出（忽略水位）
+                      </button>
+                    </div>
+                  </div>
+
+                  <label className="checkbox-label">
+                    <input
+                      type="checkbox"
+                      checked={includeRaw}
+                      disabled={jobRunning}
+                      onChange={(e) => setIncludeRaw(e.target.checked)}
+                    />
+                    <span>附带完整接口响应（raw/）</span>
+                  </label>
+                </div>
+
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  disabled={!auth.authenticated || jobRunning || enabledSavedCount === 0}
+                  onClick={startMultiSyncExport}
+                >
+                  {syncMode === 'incremental'
+                    ? `一键增量导出（已启用 ${enabledSavedCount} 人）`
+                    : `一键全量导出（已启用 ${enabledSavedCount} 人）`}
+                </button>
+              </div>
+            </div>
+          ) : (
+            <>
+              <div className="controls-panel">
             <div className="control-group">
               <label className="group-label">查询玩家</label>
               <div className="segmented">
@@ -823,6 +1310,8 @@ export function App() {
                 {listLoading ? '加载中...' : '加载更多比赛'}
               </button>
             </div>
+          )}
+            </>
           )}
         </section>
       </main>

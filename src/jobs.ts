@@ -9,6 +9,12 @@ import {
   removeTempDirSafe
 } from './export.js';
 import {
+  type PlayerSourceWatermark,
+  type PlayersStore,
+  shouldStopAtWatermark,
+  STEAM_ID64_RE
+} from './players-store.js';
+import {
   AuthExpiredError,
   type MatchSource,
   type PerfectWorldProvider,
@@ -62,8 +68,16 @@ export interface StartRecentJobParams {
   includeRaw: boolean;
 }
 
+export interface StartMultiSyncJobParams {
+  steamIds: string[];
+  sources: MatchSource[];
+  syncMode: 'incremental' | 'full';
+  includeRaw: boolean;
+}
+
 export interface JobManagerOptions {
   tempRootDir: string;
+  playersStore?: PlayersStore;
   detailDelayMs?: number;
   listDelayMs?: number;
   retryBaseDelayMs?: number;
@@ -91,19 +105,36 @@ function sleepAbortable(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+interface ScanTask {
+  steamId: string;
+  note: string;
+  source: MatchSource;
+  watermark?: PlayerSourceWatermark;
+  nextPage: number;
+  cursor: string | number | null;
+  done: boolean;
+  discoveredMatchIds: string[];
+  latestCandidate: { matchId: string; startTime: string | null } | null;
+}
+
 interface ActiveJobInternal {
   jobId: string;
   workDir: string;
-  mode: 'selected' | 'recent';
+  mode: 'selected' | 'recent' | 'multi_sync';
   status: JobStatus;
   source: MatchSource;
+  sources: MatchSource[];
   targetSteamId: string;
+  targetSteamIds: string[];
+  syncMode?: 'incremental' | 'full';
   includeRaw: boolean;
   requestedCount: number;
   singleMatchRequested: boolean;
   listCompleted: boolean;
   nextPage: number;
   listCursor: string | number | null;
+  scanTasks: ScanTask[];
+  matchSources: Map<string, MatchSource>;
   seenIds: Set<string>;
   usedFilenames: Set<string>;
   remainingIds: string[];
@@ -119,6 +150,7 @@ interface ActiveJobInternal {
 
 export class ExportJobManager {
   private readonly provider: PerfectWorldProvider;
+  private readonly playersStore?: PlayersStore;
   private readonly tempRootDir: string;
   private readonly detailDelayMs: number;
   private readonly listDelayMs: number;
@@ -133,6 +165,7 @@ export class ExportJobManager {
 
   constructor(provider: PerfectWorldProvider, options: JobManagerOptions) {
     this.provider = provider;
+    this.playersStore = options.playersStore;
     this.tempRootDir = options.tempRootDir;
     this.detailDelayMs = options.detailDelayMs ?? 600;
     this.listDelayMs = options.listDelayMs ?? 500;
@@ -172,12 +205,21 @@ export class ExportJobManager {
       this.job.remainingIds.length +
       this.job.cancelledCount;
 
+    const sourceLabel =
+      this.job.sources.length > 1
+        ? this.job.sources.map((s) => SOURCE_CONFIG[s].label).join(' + ')
+        : SOURCE_CONFIG[this.job.source].label;
+    const targetSteamIdLabel =
+      this.job.targetSteamIds.length > 1
+        ? `共 ${this.job.targetSteamIds.length} 人`
+        : this.job.targetSteamId;
+
     return {
       jobId: this.job.jobId,
       status: this.job.status,
       source: this.job.source,
-      sourceLabel: SOURCE_CONFIG[this.job.source].label,
-      targetSteamId: this.job.targetSteamId,
+      sourceLabel,
+      targetSteamId: targetSteamIdLabel,
       includeRaw: this.job.includeRaw,
       requestedCount: this.job.requestedCount,
       listedCount: this.job.seenIds.size,
@@ -222,19 +264,28 @@ export class ExportJobManager {
     const jobId = `job-${this.jobCounter}`;
     const workDir = path.join(this.tempRootDir, jobId);
 
+    const matchSources = new Map<string, MatchSource>();
+    for (const id of uniqueIds) {
+      matchSources.set(id, params.source);
+    }
+
     this.job = {
       jobId,
       workDir,
       mode: 'selected',
       status: 'downloading',
       source: params.source,
+      sources: [params.source],
       targetSteamId: params.targetSteamId,
+      targetSteamIds: [params.targetSteamId],
       includeRaw: params.includeRaw,
       requestedCount: uniqueIds.length,
       singleMatchRequested: uniqueIds.length === 1,
       listCompleted: true,
       nextPage: 1,
       listCursor: null,
+      scanTasks: [],
+      matchSources,
       seenIds: seen,
       usedFilenames: new Set(),
       remainingIds: uniqueIds,
@@ -269,13 +320,17 @@ export class ExportJobManager {
       mode: 'recent',
       status: 'listing',
       source: params.source,
+      sources: [params.source],
       targetSteamId: params.targetSteamId,
+      targetSteamIds: [params.targetSteamId],
       includeRaw: params.includeRaw,
       requestedCount: params.recentCount,
       singleMatchRequested: params.recentCount === 1,
       listCompleted: false,
       nextPage: 1,
       listCursor: null,
+      scanTasks: [],
+      matchSources: new Map(),
       seenIds: new Set(),
       usedFilenames: new Set(),
       remainingIds: [],
@@ -284,6 +339,99 @@ export class ExportJobManager {
       rawListPages: [],
       cancelledCount: 0,
       message: `正在加载最近 ${params.recentCount} 场比赛列表`,
+      artifact: null,
+      abortController: new AbortController(),
+      cancelRequested: false
+    };
+
+    this.runPromise = this.executeJob(this.job);
+    return this.getPublicState();
+  }
+
+  async startMultiSyncJob(params: StartMultiSyncJobParams): Promise<JobPublicState> {
+    this.assertCanStartNewJob();
+
+    const uniqueSteamIds: string[] = [];
+    const seenPlayers = new Set<string>();
+    for (const rawId of params.steamIds) {
+      const id = String(rawId).trim();
+      if (!STEAM_ID64_RE.test(id)) {
+        throw new Error(`无效的 SteamID64（需为 17 位数字）：${id}`);
+      }
+      if (!seenPlayers.has(id)) {
+        seenPlayers.add(id);
+        uniqueSteamIds.push(id);
+      }
+    }
+    if (uniqueSteamIds.length === 0) {
+      throw new Error('请至少选择一个目标玩家');
+    }
+
+    const uniqueSources: MatchSource[] = [];
+    for (const src of params.sources) {
+      if ((src === 'official' || src === 'perfectworld') && !uniqueSources.includes(src)) {
+        uniqueSources.push(src);
+      }
+    }
+    if (uniqueSources.length === 0) {
+      throw new Error('请至少选择一个比赛来源');
+    }
+
+    const savedProfiles = this.playersStore ? await this.playersStore.getAll() : [];
+    const profileMap = new Map(savedProfiles.map((p) => [p.steamId, p]));
+
+    const scanTasks: ScanTask[] = [];
+    for (const steamId of uniqueSteamIds) {
+      const profile = profileMap.get(steamId);
+      const note = profile?.note || steamId.slice(-6);
+      for (const source of uniqueSources) {
+        const watermark =
+          params.syncMode === 'incremental' ? profile?.watermarks[source] : undefined;
+        scanTasks.push({
+          steamId,
+          note,
+          source,
+          watermark,
+          nextPage: 1,
+          cursor: null,
+          done: false,
+          discoveredMatchIds: [],
+          latestCandidate: null
+        });
+      }
+    }
+
+    await this.cleanupPreviousJobWorkDir();
+    this.jobCounter++;
+    const jobId = `job-${this.jobCounter}`;
+    const workDir = path.join(this.tempRootDir, jobId);
+
+    this.job = {
+      jobId,
+      workDir,
+      mode: 'multi_sync',
+      status: 'listing',
+      source: uniqueSources[0],
+      sources: uniqueSources,
+      targetSteamId: uniqueSteamIds[0],
+      targetSteamIds: uniqueSteamIds,
+      syncMode: params.syncMode,
+      includeRaw: params.includeRaw,
+      requestedCount: 0,
+      singleMatchRequested: false,
+      listCompleted: false,
+      nextPage: 1,
+      listCursor: null,
+      scanTasks,
+      matchSources: new Map(),
+      seenIds: new Set(),
+      usedFilenames: new Set(),
+      remainingIds: [],
+      succeeded: [],
+      failures: [],
+      rawListPages: [],
+      cancelledCount: 0,
+      message: `正在准备扫描 ${uniqueSteamIds.length} 位玩家的比赛记录`,
       artifact: null,
       abortController: new AbortController(),
       cancelRequested: false
@@ -386,63 +534,141 @@ export class ExportJobManager {
     const signal = job.abortController?.signal ?? new AbortController().signal;
 
     try {
-      // Phase 1: list pagination for recent N
-      while (!job.listCompleted) {
-        if (job.cancelRequested || signal.aborted) {
-          await this.finalizeCancelled(job);
-          return;
-        }
-        if (job.seenIds.size >= job.requestedCount || job.nextPage > this.maxListPages) {
-          job.listCompleted = true;
-          break;
-        }
+      // Phase 1: list pagination
+      if (job.mode === 'multi_sync') {
+        for (const task of job.scanTasks) {
+          if (task.done) continue;
+          const sourceLabel = SOURCE_CONFIG[task.source].label;
+          const taskSeen = new Set<string>(task.discoveredMatchIds);
 
-        job.status = 'listing';
-        job.message = `正在读取比赛列表第 ${job.nextPage} 页（已收集 ${job.seenIds.size}/${job.requestedCount} 场）`;
+          while (!task.done && task.nextPage <= this.maxListPages) {
+            if (job.cancelRequested || signal.aborted) {
+              await this.finalizeCancelled(job);
+              return;
+            }
 
-        const pageResult = await this.provider.fetchMatchListPage({
-          source: job.source,
-          targetSteamId: job.targetSteamId,
-          page: job.nextPage,
-          pageSize: this.listPageSize,
-          cursor: job.listCursor,
-          signal
-        });
+            job.status = 'listing';
+            job.message = `正在扫描 ${task.note} 的${sourceLabel}第 ${task.nextPage} 页（已收集 ${job.seenIds.size} 场唯一比赛）`;
 
-        if (job.includeRaw) {
-          job.rawListPages.push({
-            pageIndex: job.nextPage,
-            rawBody: pageResult.rawBody
-          });
-        }
+            const pageResult = await this.provider.fetchMatchListPage({
+              source: task.source,
+              targetSteamId: task.steamId,
+              page: task.nextPage,
+              pageSize: this.listPageSize,
+              cursor: task.cursor,
+              signal
+            });
 
-        let addedOnPage = 0;
-        for (const item of pageResult.matches) {
-          if (!job.seenIds.has(item.matchId)) {
-            job.seenIds.add(item.matchId);
-            job.remainingIds.push(item.matchId);
-            addedOnPage++;
-            if (job.seenIds.size >= job.requestedCount) {
+            if (job.includeRaw) {
+              job.rawListPages.push({
+                pageIndex: task.nextPage,
+                prefix: `${task.source}-${task.steamId}`,
+                rawBody: pageResult.rawBody
+              });
+            }
+
+            let addedToTask = 0;
+            let hitWatermark = false;
+            for (const item of pageResult.matches) {
+              if (task.watermark && shouldStopAtWatermark(item, task.watermark)) {
+                hitWatermark = true;
+                break;
+              }
+              if (!task.latestCandidate) {
+                task.latestCandidate = {
+                  matchId: item.matchId,
+                  startTime: item.startTime ?? item.endTime ?? null
+                };
+              }
+              if (!taskSeen.has(item.matchId)) {
+                taskSeen.add(item.matchId);
+                task.discoveredMatchIds.push(item.matchId);
+                addedToTask++;
+              }
+              if (!job.seenIds.has(item.matchId)) {
+                job.seenIds.add(item.matchId);
+                job.matchSources.set(item.matchId, task.source);
+                job.remainingIds.push(item.matchId);
+              }
+            }
+
+            const nextCursor = pageResult.nextCursor;
+            const cursorStuck =
+              addedToTask === 0 && (nextCursor === null || nextCursor === task.cursor);
+            if (hitWatermark || pageResult.matches.length === 0 || cursorStuck) {
+              task.done = true;
               break;
             }
+
+            task.cursor = nextCursor;
+            task.nextPage++;
+            await sleepAbortable(this.listDelayMs, signal);
+          }
+
+          if (task.nextPage > this.maxListPages) {
+            task.done = true;
           }
         }
+        job.listCompleted = true;
+      } else {
+        while (!job.listCompleted) {
+          if (job.cancelRequested || signal.aborted) {
+            await this.finalizeCancelled(job);
+            return;
+          }
+          if (job.seenIds.size >= job.requestedCount || job.nextPage > this.maxListPages) {
+            job.listCompleted = true;
+            break;
+          }
 
-        const nextCursor = pageResult.nextCursor;
-        const cursorStuck =
-          addedOnPage === 0 && (nextCursor === null || nextCursor === job.listCursor);
-        if (
-          pageResult.matches.length === 0 ||
-          cursorStuck ||
-          job.seenIds.size >= job.requestedCount
-        ) {
-          job.listCompleted = true;
-          break;
+          job.status = 'listing';
+          job.message = `正在读取比赛列表第 ${job.nextPage} 页（已收集 ${job.seenIds.size}/${job.requestedCount} 场）`;
+
+          const pageResult = await this.provider.fetchMatchListPage({
+            source: job.source,
+            targetSteamId: job.targetSteamId,
+            page: job.nextPage,
+            pageSize: this.listPageSize,
+            cursor: job.listCursor,
+            signal
+          });
+
+          if (job.includeRaw) {
+            job.rawListPages.push({
+              pageIndex: job.nextPage,
+              rawBody: pageResult.rawBody
+            });
+          }
+
+          let addedOnPage = 0;
+          for (const item of pageResult.matches) {
+            if (!job.seenIds.has(item.matchId)) {
+              job.seenIds.add(item.matchId);
+              job.matchSources.set(item.matchId, job.source);
+              job.remainingIds.push(item.matchId);
+              addedOnPage++;
+              if (job.seenIds.size >= job.requestedCount) {
+                break;
+              }
+            }
+          }
+
+          const nextCursor = pageResult.nextCursor;
+          const cursorStuck =
+            addedOnPage === 0 && (nextCursor === null || nextCursor === job.listCursor);
+          if (
+            pageResult.matches.length === 0 ||
+            cursorStuck ||
+            job.seenIds.size >= job.requestedCount
+          ) {
+            job.listCompleted = true;
+            break;
+          }
+
+          job.listCursor = nextCursor;
+          job.nextPage++;
+          await sleepAbortable(this.listDelayMs, signal);
         }
-
-        job.listCursor = nextCursor;
-        job.nextPage++;
-        await sleepAbortable(this.listDelayMs, signal);
       }
 
       if (job.cancelRequested || signal.aborted) {
@@ -452,7 +678,10 @@ export class ExportJobManager {
 
       if (job.remainingIds.length === 0 && job.succeeded.length === 0 && job.failures.length === 0) {
         job.status = 'completed';
-        job.message = '未查询到符合条件的比赛记录';
+        job.message =
+          job.mode === 'multi_sync'
+            ? '已完成扫描：所有选中玩家均无新增比赛'
+            : '未查询到符合条件的比赛记录';
         return;
       }
 
@@ -465,15 +694,17 @@ export class ExportJobManager {
         }
 
         const matchId = job.remainingIds[0];
+        const itemSource = job.matchSources.get(matchId) ?? job.source;
         const total = job.succeeded.length + job.failures.length + job.remainingIds.length;
         const processed = job.succeeded.length + job.failures.length + 1;
         job.message = `正在下载比赛详情 ${processed}/${total}（成功 ${job.succeeded.length}，失败 ${job.failures.length}）`;
 
         try {
-          const detail = await this.fetchDetailWithRetry(job.source, matchId, signal);
-          const filename = createMatchBaseFilename(job.source, matchId, job.usedFilenames);
+          const detail = await this.fetchDetailWithRetry(itemSource, matchId, signal);
+          const filename = createMatchBaseFilename(itemSource, matchId, job.usedFilenames);
           job.succeeded.push({
             matchId: detail.matchId,
+            source: itemSource,
             filename,
             cleanJsonText: detail.cleanJsonText,
             ...(job.includeRaw ? { rawBody: detail.rawBody } : {})
@@ -550,16 +781,38 @@ export class ExportJobManager {
     job.artifact = await buildExportArtifact({
       workDir: job.workDir,
       source: job.source,
+      sources: job.sources,
       targetSteamId: job.targetSteamId,
+      targetSteamIds: job.targetSteamIds,
       includeRaw: job.includeRaw,
       singleMatchRequested: job.singleMatchRequested,
-      requestedCount: job.requestedCount,
+      requestedCount: job.mode === 'multi_sync' ? job.seenIds.size : job.requestedCount,
       actualCount: job.seenIds.size,
       cancelledCount: job.cancelledCount,
       matches: job.succeeded,
       rawListPages: job.rawListPages,
       failures: job.failures
     });
+  }
+
+  private async advanceCompletedWatermarks(job: ActiveJobInternal): Promise<void> {
+    if (job.mode !== 'multi_sync' || !this.playersStore || job.remainingIds.length > 0) {
+      return;
+    }
+    const succeededSet = new Set(job.succeeded.map((item) => item.matchId));
+    const failedSet = new Set(job.failures.map((item) => item.matchId));
+
+    for (const task of job.scanTasks) {
+      if (!task.done || !task.latestCandidate || task.discoveredMatchIds.length === 0) {
+        continue;
+      }
+      const allSucceeded = task.discoveredMatchIds.every(
+        (id) => succeededSet.has(id) && !failedSet.has(id)
+      );
+      if (allSucceeded) {
+        await this.playersStore.advanceWatermark(task.steamId, task.source, task.latestCandidate);
+      }
+    }
   }
 
   private async finalizeCancelled(job: ActiveJobInternal): Promise<void> {
@@ -576,6 +829,7 @@ export class ExportJobManager {
 
   private async finalizeDone(job: ActiveJobInternal): Promise<void> {
     await this.tryBuildPartialArtifact(job);
+    await this.advanceCompletedWatermarks(job);
     const totalAvailable = job.seenIds.size;
     const shortageNote =
       job.mode === 'recent' && totalAvailable < job.requestedCount

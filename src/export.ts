@@ -56,6 +56,7 @@ export function createMatchBaseFilename(
 
 export interface ExportedMatchEntry {
   matchId: string;
+  source?: MatchSource;
   filename: string;
   cleanJsonText: string;
   rawBody?: string;
@@ -63,6 +64,7 @@ export interface ExportedMatchEntry {
 
 export interface ExportRawListPage {
   pageIndex: number;
+  prefix?: string;
   rawBody: string;
 }
 
@@ -77,7 +79,9 @@ export interface ExportManifest {
   exportFormatVersion: number;
   exportedAt: string;
   targetSteamId: string;
+  targetSteamIds?: string[];
   source: MatchSource;
+  sources?: MatchSource[];
   sourceLabel: string;
   dataSource: number;
   includeRawResponses: boolean;
@@ -88,6 +92,7 @@ export interface ExportManifest {
   cancelledCount: number;
   files: Array<{
     matchId: string;
+    source?: MatchSource;
     file: string;
     rawFile?: string;
   }>;
@@ -119,7 +124,9 @@ export async function removeTempDirSafe(dirPath: string | null): Promise<void> {
 export async function buildExportArtifact(params: {
   workDir: string;
   source: MatchSource;
+  sources?: MatchSource[];
   targetSteamId: string;
+  targetSteamIds?: string[];
   includeRaw: boolean;
   singleMatchRequested: boolean;
   requestedCount: number;
@@ -138,8 +145,14 @@ export async function buildExportArtifact(params: {
   const sourceCfg = SOURCE_CONFIG[params.source];
   await mkdir(params.workDir, { recursive: true });
 
+  const rawListPath = (p: ExportRawListPage) => {
+    const prefix = p.prefix ? `${sanitizeFilenameSegment(p.prefix)}-` : '';
+    return `raw/list/${prefix}page-${String(p.pageIndex).padStart(3, '0')}.json`;
+  };
+
   const manifestFiles: ExportManifest['files'] = params.matches.map((item) => ({
     matchId: item.matchId,
+    ...(item.source ? { source: item.source } : {}),
     file: `matches/${item.filename}`,
     ...(params.includeRaw && item.rawBody !== undefined
       ? { rawFile: `raw/matches/${item.filename}` }
@@ -148,7 +161,7 @@ export async function buildExportArtifact(params: {
 
   const rawListFiles =
     params.includeRaw && params.rawListPages.length > 0
-      ? params.rawListPages.map((p) => `raw/list/page-${String(p.pageIndex).padStart(3, '0')}.json`)
+      ? params.rawListPages.map(rawListPath)
       : undefined;
 
   const manifest: ExportManifest = {
@@ -157,8 +170,15 @@ export async function buildExportArtifact(params: {
     exportFormatVersion: EXPORT_FORMAT_VERSION,
     exportedAt: now.toISOString(),
     targetSteamId: params.targetSteamId,
+    ...(params.targetSteamIds && params.targetSteamIds.length > 0
+      ? { targetSteamIds: params.targetSteamIds }
+      : {}),
     source: params.source,
-    sourceLabel: sourceCfg.label,
+    ...(params.sources && params.sources.length > 0 ? { sources: params.sources } : {}),
+    sourceLabel:
+      params.sources && params.sources.length > 1
+        ? params.sources.map((s) => SOURCE_CONFIG[s].label).join(' + ')
+        : sourceCfg.label,
     dataSource: sourceCfg.dataSource,
     includeRawResponses: params.includeRaw,
     requestedCount: params.requestedCount,
@@ -204,8 +224,7 @@ export async function buildExportArtifact(params: {
 
   if (params.includeRaw) {
     for (const page of params.rawListPages) {
-      const pageName = `raw/list/page-${String(page.pageIndex).padStart(3, '0')}.json`;
-      zip.file(pageName, page.rawBody);
+      zip.file(rawListPath(page), page.rawBody);
     }
   }
 
