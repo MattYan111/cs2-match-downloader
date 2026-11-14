@@ -372,7 +372,7 @@ export class PerfectWorldProvider {
     }
 
     const { dataSource } = SOURCE_CONFIG[params.source];
-    const pageSize = params.pageSize ?? 20;
+    const pageSize = params.pageSize ?? 100;
     const candidates =
       params.page === 1
         ? [this.workingAppVersion, ...APP_VERSIONS.filter((v) => v !== this.workingAppVersion)]

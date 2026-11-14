@@ -304,10 +304,17 @@ export function App() {
         source,
         targetSteamId: activeTargetSteamId,
         page: pageToFetch,
-        pageSize: 20,
+        pageSize: 100,
         cursor: cursorToSend,
         reset
       });
+
+      const knownIds = reset ? new Set<string>() : new Set(matches.map((m) => m.matchId));
+      const uniqueNewCount = res.matches.reduce((count, item) => {
+        if (knownIds.has(item.matchId)) return count;
+        knownIds.add(item.matchId);
+        return count + 1;
+      }, 0);
 
       setMatches((prev) => {
         const base = reset ? [] : prev;
@@ -326,7 +333,7 @@ export function App() {
       }
       setNextCursor(res.nextCursor);
       setNextPage(pageToFetch + 1);
-      setHasMore(res.hasMore);
+      setHasMore(res.hasMore && (reset || uniqueNewCount > 0));
       setListLoadedOnce(true);
     } catch (error) {
       const err = error as Error & { authExpired?: boolean };

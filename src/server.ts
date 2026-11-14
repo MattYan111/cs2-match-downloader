@@ -192,9 +192,9 @@ export function createDownloaderApp(options: AppServerOptions & { getBoundPort: 
         : authSteamId;
     const page = typeof body.page === 'number' && Number.isInteger(body.page) && body.page >= 1 ? body.page : 1;
     const pageSize =
-      typeof body.pageSize === 'number' && Number.isInteger(body.pageSize) && body.pageSize >= 1 && body.pageSize <= 100
+      typeof body.pageSize === 'number' && Number.isInteger(body.pageSize) && body.pageSize >= 1 && body.pageSize <= 500
         ? body.pageSize
-        : 20;
+        : 100;
     const cursor =
       typeof body.cursor === 'string' || typeof body.cursor === 'number' ? body.cursor : null;
     const reset = body.reset === true || page === 1;

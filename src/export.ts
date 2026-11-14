@@ -5,7 +5,7 @@ import JSZip from 'jszip';
 import { type MatchSource, SOURCE_CONFIG } from './provider/perfectworld.js';
 
 export const TOOL_NAME = 'pw-match-downloader';
-export const TOOL_VERSION = '0.2.0';
+export const TOOL_VERSION = '0.2.1';
 export const EXPORT_FORMAT_VERSION = 1;
 
 const WINDOWS_RESERVED_RE = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;

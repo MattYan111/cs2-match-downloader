@@ -171,7 +171,7 @@ export class ExportJobManager {
     this.listDelayMs = options.listDelayMs ?? 500;
     this.retryBaseDelayMs = options.retryBaseDelayMs ?? 1200;
     this.maxDetailAttempts = options.maxDetailAttempts ?? 3;
-    this.listPageSize = options.listPageSize ?? 50;
+    this.listPageSize = options.listPageSize ?? 100;
     this.maxListPages = options.maxListPages ?? 40;
   }
 
@@ -567,11 +567,8 @@ export class ExportJobManager {
               });
             }
 
-            let addedToTask = 0;
-            let hitWatermark = false;
             for (const item of pageResult.matches) {
               if (task.watermark && shouldStopAtWatermark(item, task.watermark)) {
-                hitWatermark = true;
                 break;
               }
               if (!task.latestCandidate) {
@@ -583,7 +580,6 @@ export class ExportJobManager {
               if (!taskSeen.has(item.matchId)) {
                 taskSeen.add(item.matchId);
                 task.discoveredMatchIds.push(item.matchId);
-                addedToTask++;
               }
               if (!job.seenIds.has(item.matchId)) {
                 job.seenIds.add(item.matchId);
@@ -592,17 +588,11 @@ export class ExportJobManager {
               }
             }
 
-            const nextCursor = pageResult.nextCursor;
-            const cursorStuck =
-              addedToTask === 0 && (nextCursor === null || nextCursor === task.cursor);
-            if (hitWatermark || pageResult.matches.length === 0 || cursorStuck) {
-              task.done = true;
-              break;
-            }
-
-            task.cursor = nextCursor;
-            task.nextPage++;
-            await sleepAbortable(this.listDelayMs, signal);
+            // Upstream /api/csgo/home/match/list (csgoSeasonId="recent") ignores pagination on
+            // official matches and repeats page 1 on page 2 when pageSize=100, so page 1 alone
+            // retrieves up to this.listPageSize (100) recent matches per player/source.
+            task.done = true;
+            break;
           }
 
           if (task.nextPage > this.maxListPages) {
