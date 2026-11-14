@@ -1,6 +1,6 @@
 {
   "name": "pw-match-downloader",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "本地扫码下载完美电竞 CS2 国服官匹与完美平台原始比赛数据",
   "type": "module",
